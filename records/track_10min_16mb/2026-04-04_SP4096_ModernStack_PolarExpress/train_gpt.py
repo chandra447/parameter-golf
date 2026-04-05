@@ -46,6 +46,14 @@ class Hyperparameters():
     val_loss_every = int(os.environ.get('VAL_LOSS_EVERY', 4000))
     sliding_window_enabled = bool(int(os.environ.get('SLIDING_WINDOW_ENABLED', '1')))
 
+    # SLOT (Self-Learning Optimization at Test-time)
+    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '0')))
+    slot_max_iter = int(os.environ.get('SLOT_MAX_ITER', '25'))
+    slot_history = int(os.environ.get('SLOT_HISTORY', '20'))
+    slot_lr = float(os.environ.get('SLOT_LR', '1.0'))
+    slot_delta_clip = float(os.environ.get('SLOT_DELTA_CLIP', '5.0'))
+    slot_focal_tokens = int(os.environ.get('SLOT_FOCAL_TOKENS', '128'))
+
     # Model architecture
     vocab_size = int(os.environ.get('VOCAB_SIZE', 4096))
     num_layers = int(os.environ.get('NUM_LAYERS', 11))
@@ -665,6 +673,10 @@ class GPT(nn.Module):
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
+        return self.compute_logits(self.forward_hidden(input_ids))
+
+    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+        """Run transformer blocks, returning hidden states before final norm + projection."""
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -687,7 +699,11 @@ class GPT(nn.Module):
                     x = x + scaled_skip
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0, v_embed=ve)
-        x = self.final_norm(x)
+        return x
+
+    def compute_logits(self, hidden: Tensor) -> Tensor:
+        """Apply final RMSNorm + projection to hidden states. Position-independent."""
+        x = self.final_norm(hidden)
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
@@ -1404,6 +1420,133 @@ def eval_val_sliding(
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
+def eval_val_slot(
+    h: Hyperparameters,
+    device: torch.device,
+    val_data: ValidationData,
+    base_model: nn.Module,
+) -> tuple[float, float]:
+    """L-BFGS Causal SLOT evaluation: logit-space delta optimized on already-scored context positions.
+
+    For each sliding window:
+      1. Run frozen forward pass to get base logits.
+      2. Optimize a logit-space delta on context positions (already scored).
+      3. Score new positions using base_logits + delta.
+      4. Warm-start delta for the next window.
+    """
+    base_model.eval()
+
+    seq_len = h.eval_seq_len
+    stride = h.eval_stride
+    context_size = seq_len - stride
+    focal_tokens = h.slot_focal_tokens
+    vocab_size = h.vocab_size
+    total_tokens = val_data.val_tokens.numel() - 1
+
+    # Build window starts (same as eval_val_sliding)
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if ws + context_size < total_tokens]
+
+    total_windows = len(window_starts)
+    my_s = (total_windows * h.rank) // h.world_size
+    my_e = (total_windows * (h.rank + 1)) // h.world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Warm-start delta: persistent across windows
+    delta = torch.zeros(1, 1, vocab_size, device=device, dtype=torch.float32)
+
+    for win_idx, ws in enumerate(my_windows):
+        we = min(ws + seq_len, total_tokens)
+        wlen = we - ws
+        chunk = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
+        x = chunk[:-1].unsqueeze(0)   # (1, wlen)
+        y = chunk[1:].unsqueeze(0)    # (1, wlen)
+
+        # Determine which positions to score (new positions = [s, wlen))
+        s = 0 if ws == 0 else context_size
+
+        # --- Frozen forward pass for base logits ---
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits_base = base_model.compute_logits(
+                    base_model.forward_hidden(x)
+                ).float()  # (1, wlen, vocab)
+
+        # --- L-BFGS optimization of delta on causal context positions ---
+        # opt_positions: already-scored context positions ending just before s
+        # focal window: last `focal_tokens` positions before s
+        if s > 0:
+            focal_start = max(0, s - focal_tokens)
+            opt_len = s - focal_start  # number of positions to optimize on
+
+            # detach base logits for opt positions; only delta is differentiable
+            logits_opt_base = logits_base[:, focal_start:s, :].detach()  # (1, opt_len, vocab)
+            y_opt = y[:, focal_start:s].reshape(-1)                       # (opt_len,)
+
+            # Re-initialize delta with warm-start value but make it a leaf with grad
+            delta_param = delta.detach().clone().requires_grad_(True)
+
+            optimizer_lbfgs = torch.optim.LBFGS(
+                [delta_param],
+                max_iter=h.slot_max_iter,
+                history_size=h.slot_history,
+                lr=h.slot_lr,
+                line_search_fn="strong_wolfe",
+            )
+
+            def closure():
+                optimizer_lbfgs.zero_grad()
+                logits_shifted = logits_opt_base + delta_param  # broadcast over opt_len
+                loss = F.cross_entropy(
+                    logits_shifted.reshape(-1, vocab_size),
+                    y_opt,
+                    reduction="mean",
+                )
+                loss.backward()
+                return loss
+
+            optimizer_lbfgs.step(closure)
+
+            with torch.no_grad():
+                delta_param.clamp_(-h.slot_delta_clip, h.slot_delta_clip)
+
+            # Update warm-start delta for next window
+            delta = delta_param.detach()
+        # else: first window, keep delta as zeros
+
+        # --- Score new positions using base_logits + delta ---
+        with torch.no_grad():
+            logits_scored = logits_base[:, s:wlen, :] + delta  # (1, stride_actual, vocab)
+            y_scored = y[:, s:wlen].reshape(-1)
+
+            nll = F.cross_entropy(
+                logits_scored.reshape(-1, vocab_size),
+                y_scored,
+                reduction="none",
+            ).to(torch.float64)
+
+            loss_sum += nll.sum()
+            token_count += float(wlen - s)
+
+            tgt = y[0, s:wlen]
+            prev = x[0, s:wlen]
+            tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+            tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+            byte_count += tb.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    base_model.train()
+    return _loss_bpb(loss_sum, token_count, byte_count)
+
+
 def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1424,6 +1567,8 @@ def run_evals(
     timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
+    if h.slot_enabled:
+        timed_eval("final_int6_slot", eval_val_slot, h, device, val_data, eval_model)
 
 # -----------------------------
 # Training
