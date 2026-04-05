@@ -39,7 +39,7 @@ class Hyperparameters():
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     eval_seq_len = int(os.environ.get('EVAL_SEQ_LEN', 2048))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
-    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
+    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 50))
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))

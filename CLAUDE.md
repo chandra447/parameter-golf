@@ -141,25 +141,68 @@ Store hypothesis documents in `experiments/hypotheses/<date>-<name>.md`.
 
 Training is done on RunPod with H100 instances. The HF token must be passed as an environment variable.
 
-```bash
-# Get HF token from environment
-export HF_TOKEN=$(printenv HF_TOKEN)
+**Correct Docker image** (torch 2.9.1 required for flash_attn_3):
+```
+runpod/pytorch:1.0.3-cu1290-torch291-ubuntu2204
+```
+- CUDA 12.9.0, PyTorch 2.9.1, Python 3.11, Ubuntu 22.04
+- ⚠️ Do NOT use `runpod/pytorch:2.4.0-*` — flash_attn_3 wheels target torch291 and will fail with torch 2.4
 
-# When launching RunPod pod, pass env vars:
-# HF_TOKEN=$HF_TOKEN
+**Launch command (1×H100 smoke test):**
+```bash
+runpodctl pod create \
+  --name "pg-<experiment>-smoke" \
+  --gpu-id "NVIDIA H100 80GB HBM3" \
+  --gpu-count 1 \
+  --image "runpod/pytorch:1.0.3-cu1290-torch291-ubuntu2204" \
+  --container-disk-in-gb 50 \
+  --volume-in-gb 100 \
+  --env '{"HF_TOKEN":"<token>"}' \
+  --ports "22/tcp"
+```
+
+**Launch command (8×H100 full run):**
+```bash
+runpodctl pod create \
+  --name "pg-<experiment>-3seed" \
+  --gpu-id "NVIDIA H100 80GB HBM3" \
+  --gpu-count 8 \
+  --image "runpod/pytorch:1.0.3-cu1290-torch291-ubuntu2204" \
+  --container-disk-in-gb 50 \
+  --volume-in-gb 100 \
+  --env '{"HF_TOKEN":"<token>"}' \
+  --ports "22/tcp"
 ```
 
 **RunPod setup for each experiment:**
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install flash_attn_3 + deps (requires torch 2.9.1 image above)
+pip install flash_attn_3 \
+  --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291 \
+  --quiet
+pip install sentencepiece zstandard trackio brotli --quiet
 
-# Download data (uses HF token)
-HF_TOKEN=$HF_TOKEN python data/download_hf_docs_and_tokenize.py
+# Clone our fork
+git clone https://github.com/chandra447/parameter-golf.git
+cd parameter-golf
 
-# Run training
-python train_gpt.py
+# Download data (variant: sp4096 or sp1024) — no --skip-manifest on first run
+MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+HF_TOKEN=$HF_TOKEN python3.12 data/cached_challenge_fineweb.py --variant sp4096
+
+# Smoke test (1×H100) — see records/<experiment>/run_smoke.sh
+torchrun --standalone --nproc_per_node=1 records/<experiment>/train_gpt.py
+
+# Full 3-seed run (8×H100) — see records/<experiment>/run_3seed.sh
+torchrun --standalone --nproc_per_node=8 records/<experiment>/train_gpt.py
 ```
+
+⚠️ **Use `python3.12` not `python3`** — this image has Python 3.10 as the system default but torch/flash_attn are installed for Python 3.12. `torchrun` uses 3.12 automatically.
+
+**Trackio / logging cadence:**
+- `TRAIN_LOG_EVERY=50` (default in our scripts) — logs every 50 steps (~2 min intervals on 1×H100, ~15s on 8×H100)
+- `val_loss_every=4000` — val eval only near end of training
+- Trackio logs are tied to `train_log_every`, so dashboard updates at the same cadence
 
 **Target hardware**: 8×H100 SXM (for official leaderboard), single H100 acceptable for ablation runs.
 
