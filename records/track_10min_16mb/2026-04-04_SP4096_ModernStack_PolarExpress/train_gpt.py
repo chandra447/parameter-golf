@@ -979,8 +979,8 @@ def collect_hessians(
             )
             model.forward_logits(x)
 
-    for h in hooks:
-        h.remove()
+    for hook in hooks:
+        hook.remove()
 
     for name in hessians:
         hessians[name] = hessians[name].cpu() / n_calibration_batches
@@ -1597,8 +1597,31 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         train_loss = step_fn(step, scale)
 
         with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+            # Use named_parameters() instead of state_dict() to correctly handle shared
+            # weights from depth recurrence (blocks[5].mlp = blocks[4].mlp).
+            # state_dict() deduplicates shared tensors (only stores blocks.4.mlp.*),
+            # so blocks.5.mlp.* in ema_state would stop updating after recurrence is applied.
+            seen_data_ptrs = set()
+            for name, param in base_model.named_parameters():
+                ptr = param.data_ptr()
+                if ptr in seen_data_ptrs:
+                    # Shared param: copy the EMA from the canonical (first-seen) name
+                    # The canonical key is already updated above; find it.
+                    continue
+                seen_data_ptrs.add(ptr)
+                if name in ema_state:
+                    ema_state[name].mul_(ema_decay).add_(param.detach().float(), alpha=1.0 - ema_decay)
+            # Sync shared-weight EMA slots: any ema_state key not updated above
+            # (because it was deduplicated) should mirror its canonical counterpart.
+            param_ptr_to_ema_name: dict[int, str] = {}
+            for name, param in base_model.named_parameters():
+                ptr = param.data_ptr()
+                if ptr not in param_ptr_to_ema_name:
+                    param_ptr_to_ema_name[ptr] = name
+            for name, param in base_model.named_parameters():
+                canonical = param_ptr_to_ema_name[param.data_ptr()]
+                if canonical != name and name in ema_state and canonical in ema_state:
+                    ema_state[name].copy_(ema_state[canonical])
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1645,6 +1668,17 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     current_state = base_model.state_dict()
     avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+
+    # Re-establish depth recurrence weight sharing after load_state_dict.
+    # load_state_dict copies tensors independently, breaking the shared reference
+    # (blocks[5].mlp = blocks[4].mlp) that was set up during training.
+    # GPTQ / serialize must see the correct shared structure.
+    if _recurrence_applied[0] and recur_layer_pairs:
+        log("depth_recurrence:re-applying weight sharing after EMA load_state_dict")
+        for src_idx, tgt_idx in recur_layer_pairs:
+            if src_idx < len(base_model.blocks) and tgt_idx < len(base_model.blocks):
+                base_model.blocks[tgt_idx].mlp = base_model.blocks[src_idx].mlp
+                log(f"depth_recurrence:blocks[{tgt_idx}].mlp <- blocks[{src_idx}].mlp (re-shared)")
 
     return base_model, compiled_model
 
