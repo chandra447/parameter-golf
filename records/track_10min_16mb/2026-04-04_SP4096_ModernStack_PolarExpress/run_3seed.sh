@@ -2,11 +2,16 @@
 # Full 3-seed run on 8×H100
 # Usage: bash run_3seed.sh
 set -euo pipefail
+
+# HF_TOKEN must be in environment (set via RunPod env or export)
+: "${HF_TOKEN:?HF_TOKEN must be set}"
+export HF_TOKEN
+
 echo "=== SP4096 Modern Stack + Polar Express NS — 3-Seed Full Run (8×H100) ==="
 echo "GPU count: $(python3.12 -c 'import torch; print(torch.cuda.device_count())')"
 
 MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
-python3.12 data/cached_challenge_fineweb.py --variant sp4096
+python3.12 data/cached_challenge_fineweb.py --variant sp4096 --skip-manifest
 
 for SEED in 42 314 999; do
   echo "=== Seed ${SEED} ==="
